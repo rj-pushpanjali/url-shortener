@@ -1,0 +1,270 @@
+# docker-compose.yml
+#
+# Stage 11: Nginx load balancer in front of THREE identical backend instances
+# that share ONE Redis and ONE PostgreSQL.
+#
+#                              +--> backend1 --+
+#   browser --> nginx :5000 ---+--> backend2 --+--> redis    (cache, rate-limit counters, job queue)
+#   (and frontend :5173        +--> backend3 --+--> postgres (users, URLs, click data)
+#    = static files via nginx)                         ^
+#   worker (ONE container: click analytics) -----------+
+#   migrate (one-shot: tables, then exits)
+#   prometheus (optional, profile "monitoring"): scrapes /metrics on backend1-3
+#
+# Production on a server with HTTPS: see docker-compose.prod.yml and DEPLOY.md.
+#
+# nginx is the ONLY way in. The backends publish no ports, so nothing can
+# reach them except through the load balancer (which is also what makes it
+# safe for them to trust nginx's X-Forwarded-For header; see TRUST_PROXY below).
+#
+# The instances are the SAME code and the SAME image; only the name differs.
+# Nothing about a user or a request lives inside a container, which is why
+# any instance can serve any request:
+#   - login state   -> a signed JWT every instance can verify (same JWT_SECRET)
+#   - URLs, users   -> PostgreSQL
+#   - redirect cache, rate-limit counters, click queue -> the one Redis
+#
+# Start:  cp .env.example .env   (fill it in)   then   docker compose up --build
+
+name: url-shortener
+
+# Shared by every service that runs the backend image (the three web
+# instances, the worker, migrations): same image, same configuration.
+x-backend: &backend
+  build: ./backend
+  image: url-shortener-backend # one image, built once, used by every service below
+  init: true # a tiny init process as PID 1 so `docker stop` is graceful
+  restart: unless-stopped
+  environment: &backend-env
+    PORT: "5000" # the port INSIDE the container; identical for every instance
+    # The public address used to build short links: nginx's published port.
+    # Not the same thing as PORT (what the app listens on inside its container).
+    BASE_URL: ${BASE_URL:-http://localhost:5000}
+    # Exactly ONE reverse proxy (nginx) sits in front of the backends, so
+    # Express takes the client IP from the entry nginx appends to
+    # X-Forwarded-For. Without this every user would look like nginx's IP and
+    # all share ONE per-IP rate limit. Safe only because the backends aren't
+    # reachable except through nginx: a client can't talk to a backend directly
+    # with a forged header. Set it empty in .env to turn it off.
+    TRUST_PROXY: ${TRUST_PROXY:-1}
+    PGHOST: postgres # one shared database. Service names are DNS names.
+    PGPORT: "5432"
+    PGUSER: ${POSTGRES_USER:-urlshortener}
+    PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the .env file}
+    PGDATABASE: ${POSTGRES_DB:-url_shortener}
+    REDIS_HOST: redis # one shared Redis
+    REDIS_PORT: "6379"
+    # MUST be the same on every instance, or a token signed by one would be
+    # rejected by the others. One variable, shared via this anchor, guarantees it.
+    JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (at least 32 characters) in the .env file}
+    JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1h}
+    BCRYPT_SALT_ROUNDS: ${BCRYPT_SALT_ROUNDS:-10}
+    URL_CACHE_TTL_SECONDS: ${URL_CACHE_TTL_SECONDS:-3600}
+    WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-5}
+    # debug | info | warn | error. Logs are one JSON object per line.
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    # Optional. Empty means "use the built-in default".
+    RATE_LIMIT_REGISTER_MAX: ${RATE_LIMIT_REGISTER_MAX:-}
+    RATE_LIMIT_LOGIN_MAX: ${RATE_LIMIT_LOGIN_MAX:-}
+    RATE_LIMIT_CREATE_URL_MAX: ${RATE_LIMIT_CREATE_URL_MAX:-}
+    RATE_LIMIT_API_MAX: ${RATE_LIMIT_API_MAX:-}
+    RATE_LIMIT_REDIRECT_MAX: ${RATE_LIMIT_REDIRECT_MAX:-}
+
+# Shared by the web instances and the worker: wait for the infrastructure
+# and for the migrations to have finished.
+x-backend-depends: &backend-depends
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  migrate:
+    condition: service_completed_successfully
+
+# Identical for all three instances. Defined on each instance rather than in
+# the Dockerfile because the worker and migrate containers share the image
+# but don't listen on port 5000.
+# /health is 200 when PostgreSQL is reachable (Redis down is "degraded", not
+# unhealthy) and 503 when it isn't.
+x-backend-healthcheck: &backend-healthcheck
+  test:
+    - CMD
+    - node
+    - -e
+    - "fetch('http://127.0.0.1:5000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 15s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-urlshortener}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the .env file}
+      POSTGRES_DB: ${POSTGRES_DB:-url_shortener}
+    volumes:
+      - pgdata:/var/lib/postgresql/data # data survives `docker compose down`
+    healthcheck:
+      # $$ so Compose leaves the variables for the shell INSIDE the container
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # No `ports:` on purpose. Only other containers need the database, and
+    # not publishing it avoids clashing with a Postgres already running on
+    # your machine. To look inside: docker compose exec postgres psql ...
+    #
+    # Connection budget: each Node process keeps a pool of up to 10
+    # connections. 3 instances + 1 worker = up to 40, comfortably under
+    # PostgreSQL's default limit of 100. Scaling to many more instances
+    # would need a connection pooler (e.g. PgBouncer) or smaller pools.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # ONE Redis server for the cache, rate-limit counters and the BullMQ queue.
+    # This is what makes the rate limit and the cache SHARED: if each instance
+    # had its own Redis, a client would get 3x the limit and 3 separate caches.
+    #   --appendonly yes / everysec : write to disk every second, so queued
+    #       click jobs survive a Redis restart (BullMQ's recommendation)
+    #   --maxmemory-policy noeviction : BullMQ requires this. Evicting keys
+    #       can destroy queue data. Cache entries expire by TTL instead.
+    #   --maxmemory 256mb : a ceiling so memory can't grow without bound.
+    #       When full, writes fail and the app degrades gracefully (cache
+    #       skipped, clicks dropped, rate limiting off) instead of crashing.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: applies pending SQL migrations (idempotent, safe to re-run),
+  # then exits. The instances and the worker wait for it to finish
+  # successfully. A SINGLE migrate service (rather than each instance
+  # migrating on startup) means three instances never race to migrate.
+  migrate:
+    <<: *backend
+    command: ["node", "scripts/migrate.js"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- The three web instances: same image, same code, same configuration ---
+  # Each listens on 5000 inside its container, which is the port named in
+  # nginx/nginx.conf (`server backend1:5000;` ...). No `ports:`: only nginx,
+  # on the compose network, can reach them.
+  backend1:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      INSTANCE_NAME: backend1 # shown in the X-Served-By response header
+    depends_on: *backend-depends
+    healthcheck: *backend-healthcheck
+
+  backend2:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      INSTANCE_NAME: backend2
+    depends_on: *backend-depends
+    healthcheck: *backend-healthcheck
+
+  backend3:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      INSTANCE_NAME: backend3
+    depends_on: *backend-depends
+    healthcheck: *backend-healthcheck
+
+  # The load balancer: the single entry point for the API and short links.
+  # Host port 5000 -> container port 80. Distributes requests round robin
+  # across backend1-3 (see nginx/nginx.conf).
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "5000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    # nginx looks up the backend names when it STARTS and fails if they don't
+    # exist yet, so wait until all three are healthy.
+    depends_on:
+      backend1:
+        condition: service_healthy
+      backend2:
+        condition: service_healthy
+      backend3:
+        condition: service_healthy
+    healthcheck:
+      # /nginx-health is answered by nginx itself (see nginx.conf)
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # Same image, different command: the BullMQ consumer that writes clicks to
+  # PostgreSQL. ONE worker serves clicks from all three instances, because
+  # they all enqueue into the same shared Redis. A separate container, so slow
+  # or failing analytics writes can never slow down or crash redirects.
+  worker:
+    <<: *backend
+    command: ["node", "src/queues/clickEvent.worker.js"]
+    depends_on: *backend-depends
+
+  # The React app, built once and served as static files by a small nginx
+  # image (frontend/Dockerfile). Its nginx also forwards /auth and /api to the
+  # load balancer above, so the browser only ever talks to this one origin.
+  frontend:
+    build: ./frontend
+    image: url-shortener-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      nginx:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # OPTIONAL: metrics. Start with:  docker compose --profile monitoring up -d
+  # then open http://localhost:9090 (Status > Targets should show 3 backends UP).
+  # Not started by a plain `docker compose up`.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+
+volumes:
+  pgdata:
+  redisdata:
+  prometheusdata:

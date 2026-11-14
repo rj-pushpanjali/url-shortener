@@ -1,0 +1,37 @@
+# deploy/Caddyfile
+#
+# Caddy gets HTTPS certificates by itself for the two names below. Both must
+# already point at this server's public IP (DNS A records), and ports 80 and
+# 443 must be open, or certificate issuance fails.
+#
+# Caddy adds the real client IP to X-Forwarded-For; nginx appends Caddy's
+# address; the backends run with TRUST_PROXY=2 (two proxies) and so read the
+# client IP correctly for per-IP rate limits.
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# API calls go straight to the load balancer ...
+	@api path /api/* /auth/*
+	handle @api {
+		reverse_proxy nginx:80
+	}
+
+	# ... everything else is the React app.
+	handle {
+		reverse_proxy frontend:80
+	}
+}
+
+{$SHORT_DOMAIN} {
+	# The bare short domain has no page of its own: send people to the app.
+	@root path /
+	handle @root {
+		redir https://{$APP_DOMAIN} 302
+	}
+
+	# /abc123 -> the load balancer -> a backend -> 302 to the long URL.
+	handle {
+		reverse_proxy nginx:80
+	}
+}

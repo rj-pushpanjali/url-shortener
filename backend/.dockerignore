@@ -1,0 +1,12 @@
+# Keeps the build context small and, more importantly, keeps secrets and
+# local junk OUT of the image. Anything COPYed into an image is readable by
+# anyone who can pull it.
+node_modules
+npm-debug.log*
+.env
+.env.*
+!.env.example
+Dockerfile
+.dockerignore
+*.log
+test

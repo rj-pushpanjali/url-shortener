@@ -1,0 +1,56 @@
+# docker-compose.prod.yml
+#
+# Production OVERRIDE for a single server with a domain name. It is layered
+# on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# What it changes:
+#   - adds Caddy, the only public entry point: ports 80/443, and it obtains
+#     and renews HTTPS certificates automatically (Let's Encrypt)
+#   - stops publishing nginx (5000) and the frontend (5173) on the host, so
+#     nothing but Caddy is reachable from the internet
+#
+# Caddy routes (see deploy/Caddyfile), using TWO host names:
+#   APP_DOMAIN    app.example.com   /api/* and /auth/*  -> nginx (load balancer)
+#                                   everything else     -> frontend (static files)
+#   SHORT_DOMAIN  go.example.com    everything          -> nginx (short links)
+#
+# Why two names: short links live at the ROOT of their domain (/abc123),
+# which would collide with the app's own pages (/login, /register) if both
+# shared one name.
+#
+# Needs Docker Compose 2.24+ (for `!reset`). Settings go in .env, see
+# .env.production.example and DEPLOY.md. TRUST_PROXY must be 2 there:
+# the client IP passes through TWO proxies (Caddy, then nginx).
+
+services:
+  nginx:
+    ports: !reset []
+
+  frontend:
+    ports: !reset []
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN in .env (e.g. app.example.com)}
+      SHORT_DOMAIN: ${SHORT_DOMAIN:?Set SHORT_DOMAIN in .env (e.g. go.example.com)}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # certificates: keep this volume, or certificates are re-issued
+      - caddy_config:/config
+    depends_on:
+      nginx:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

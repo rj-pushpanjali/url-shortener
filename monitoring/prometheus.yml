@@ -1,0 +1,23 @@
+# monitoring/prometheus.yml
+#
+# Scrapes /metrics on each backend INSTANCE directly (internal Docker network).
+# nginx answers 404 for /metrics on purpose, so the load balancer is not used.
+# Prometheus labels every series with its target (instance="backend1:5000"),
+# so you can look at one instance or sum across all three.
+#
+# Handy queries (http://localhost:9090/graph):
+#   sum(rate(http_requests_total[1m]))                              requests per second, all instances
+#   sum by (instance) (rate(http_requests_total[1m]))              ...per instance (shows the load balancing)
+#   histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{route="/:code"}[1m])))   redirect p95
+#   sum(rate(redirect_cache_lookups_total{result="hit"}[5m])) / sum(rate(redirect_cache_lookups_total[5m]))   cache hit ratio
+#   sum(rate(rate_limited_total[1m])) by (limiter)                  429s by limiter
+#   sum(rate(click_events_dropped_total[5m]))                       clicks lost because Redis was unavailable
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: url-shortener-backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["backend1:5000", "backend2:5000", "backend3:5000"]
