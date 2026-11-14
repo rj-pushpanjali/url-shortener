@@ -5,7 +5,7 @@
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node start-all.js",
     "dev": "node --watch src/server.js",
     "worker": "node src/queues/clickEvent.worker.js",
     "dev:worker": "node --watch src/queues/clickEvent.worker.js",
