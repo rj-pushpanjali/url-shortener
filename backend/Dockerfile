@@ -31,6 +31,8 @@ USER node
 
 EXPOSE 5000
 
+
 # Exec form (a JSON array) so Node receives signals directly; compose also
 # sets `init: true` so a real init process handles SIGTERM on `docker stop`.
-CMD ["node", "src/server.js"]
+
+CMD ["sh", "-c", "npm run migrate && npm start"]
